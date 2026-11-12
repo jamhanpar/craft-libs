@@ -67,6 +67,11 @@ fn not_running(app: &App, answer: Result<bool, String>) -> Result<(), String> {
     }
 }
 
+/// [`install`], with `commit` called once a portable ZIP's new files are in place and its version
+/// checked, so the caller can save its record; an error from it rolls the previous copy back
+/// (Windows only; ignored elsewhere). Refuses before downloading when the app is running, the
+/// asset isn't the release's version (`bind_artifact_version`), a newer copy is installed, or the
+/// link isn't the release's own (`check_download_link`).
 #[allow(clippy::too_many_arguments)]
 pub fn install_at(
     app: &App,
@@ -97,6 +102,7 @@ pub fn install_at(
     {
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
+    check_download_link(app, release, asset)?;
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
     let file = download(release, asset, job)?;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
@@ -180,13 +186,15 @@ pub(crate) fn bind_artifact_version(app: &App, release: &Release, asset: &Asset)
     }
 
     // The release tag and filename embedded in a release download URL (`.../releases/download/<tag>/<name>`).
-    if let Some(rest) = asset.url.split("/releases/download/").nth(1) {
+    // A `+` in either is `%2B` there, as GitHub and `expected_download_url` write it; no other
+    // escape is decoded, so anything else still has to match as written.
+    if let Some((_, rest)) = asset.url.split_once("/releases/download/") {
         let mut parts = rest.split('/');
-        let tag = parts.next().unwrap_or("");
-        let url_filename = parts.next().unwrap_or("");
+        let tag = parts.next().unwrap_or("").replace("%2B", "+");
+        let url_filename = parts.next().unwrap_or("").replace("%2B", "+");
         if tag.is_empty()
             || release_version
-                .map_or(tag != release.tag, |release_version| tag != release.tag && version::parse(tag).as_ref() != Some(release_version))
+                .map_or(tag != release.tag, |release_version| tag != release.tag && version::parse(&tag).as_ref() != Some(release_version))
         {
             return Err(mismatch());
         }
@@ -195,6 +203,29 @@ pub(crate) fn bind_artifact_version(app: &App, release: &Release, asset: &Asset)
         }
     }
     Ok(())
+}
+
+/// The last check before any bytes are fetched (storytold/craft-launcher#764): the link must be
+/// exactly the GitHub download for this release's tag and this asset's name in the release's
+/// repository ([`Release::repo`], else the app's own), whichever converter (API, feed or
+/// `SHA256SUMS.txt`) built the asset, and so must the link of the release's `SHA256SUMS.txt` that
+/// the download is checked against. A `+` may be written plainly or as `%2B`
+/// ([`release::same_download_url`]).
+///
+/// With this crate's `local-mirror` feature, the developer's loopback mirror is accepted too. The
+/// consumer confines those links (the launcher's feed parser does) and must turn the feature on
+/// itself (`craft-update/local-mirror`): its own feature of that name doesn't. This crate's tests
+/// accept loopback as well, as their downloads come from a server on 127.0.0.1.
+pub fn check_download_link(app: &App, release: &Release, asset: &Asset) -> Result<(), String> {
+    let repo = if release.repo.is_empty() { app.repo } else { release.repo.as_str() };
+    let own = |a: &Asset| {
+        ((cfg!(feature = "local-mirror") || cfg!(test)) && crate::http::is_loopback(&a.url))
+            || release::expected_download_url(repo, &release.tag, &a.name).is_some_and(|expected| release::same_download_url(&a.url, &expected))
+    };
+    if own(asset) && release.sums_asset().is_none_or(own) {
+        return Ok(());
+    }
+    Err(format!("{}'s download link isn't the one its release publishes ({}), so it wasn't downloaded.", app.name, asset.name))
 }
 
 /// What a new install would write over: something already at its destination that the launcher
@@ -1685,7 +1716,8 @@ pub mod macos {
     /// Detaches the image file `dmg` where it is attached with no volume mounted, which a failed
     /// attach can leave. An attachment with a mounted volume is left alone: another install may
     /// be using it. So is every attachment while a program started with `dmg` in its arguments
-    /// (another process's `hdiutil attach`) is running, or while the check for one gets no answer.
+    /// (another process's `hdiutil attach`) is running, or while the check for one gets no answer;
+    /// in that case the error gives the check's reason.
     fn detach_unmounted(dmg: &Path) -> Result<(), String> {
         detach_unmounted_with(dmg, process::running, process::run)
     }
@@ -1697,8 +1729,10 @@ pub mod macos {
         running: impl FnOnce(&Path) -> Result<bool, String>,
         run: impl Fn(&str, &[&str], Duration) -> Result<String, String>,
     ) -> Result<(), String> {
-        if running(dmg) != Ok(false) {
-            return Ok(());
+        match running(dmg) {
+            Ok(false) => {}
+            Ok(true) => return Ok(()),
+            Err(why) => return Err(format!("couldn't check for a running attach of the image ({why})")),
         }
         let info = run(HDIUTIL, &["info", "-plist"], Duration::from_secs(30))?;
         let image = [Some(dmg.to_path_buf()), std::fs::canonicalize(dmg).ok()];
@@ -1908,18 +1942,61 @@ pub mod macos {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) mod tree {
+    use std::io::Read;
+
     use super::{App, Path, PathBuf, single_top_folder};
+
+    // Bound entry count and cumulative unpacked bytes to prevent decompression bombs (CWE-409).
+    const MAX_ENTRIES: usize = 50_000;
+    const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    /// The most decompressed tar stream either pass reads: the unpacked bytes plus room for
+    /// headers, padding and metadata records.
+    const MAX_TAR_BYTES: u64 = MAX_UNPACKED_BYTES + (1 << 30);
+    /// The most a PAX or GNU long-name record may hold. The tar crate buffers such a record
+    /// whole while the iterator advances, before the loop below sees any entry size.
+    const MAX_METADATA_BYTES: u64 = 1 << 20;
+
+    /// Walks the headers of the tarball `file` without unpacking anything, and refuses a
+    /// metadata record (PAX `x`/`g`, GNU `L`/`K`) past [`MAX_METADATA_BYTES`]. A damaged
+    /// archive passes: unpacking reports it.
+    fn check_metadata(file: &Path) -> Result<(), String> {
+        let gz = std::fs::File::open(file).map_err(|e| e.to_string())?;
+        let mut tar = flate2::read::GzDecoder::new(gz).take(MAX_TAR_BYTES);
+        let mut header = [0u8; 512];
+        while tar.read_exact(&mut header).is_ok() && header.iter().any(|b| *b != 0) {
+            let size = header_size(&header[124..136]).ok_or("invalid tar header")?;
+            if matches!(header[156], b'x' | b'g' | b'L' | b'K') && size > MAX_METADATA_BYTES {
+                return Err("archive has an oversized metadata record".into());
+            }
+            let padded = size.div_ceil(512).saturating_mul(512);
+            if std::io::copy(&mut (&mut tar).take(padded), &mut std::io::sink()).map_err(|e| e.to_string())? < padded {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// A tar header's size field: octal digits, or big-endian base-256 after a set top bit.
+    fn header_size(field: &[u8]) -> Option<u64> {
+        if field.first()? & 0x80 != 0 {
+            return field
+                .iter()
+                .enumerate()
+                .try_fold(0u64, |n, (i, b)| n.checked_mul(256)?.checked_add(u64::from(if i == 0 { b & 0x7f } else { *b })));
+        }
+        let digits = std::str::from_utf8(field).ok()?.trim_matches(|c: char| c == '\0' || c == ' ');
+        if digits.is_empty() { Some(0) } else { u64::from_str_radix(digits, 8).ok() }
+    }
 
     /// Unpacks `file` and returns a staging folder laid out like `/usr/local`.
     pub fn unpack(app: &App, file: &Path, staging: &Path) -> Result<PathBuf, String> {
+        check_metadata(file)?;
         let _ = std::fs::remove_dir_all(staging);
         std::fs::create_dir_all(staging).map_err(|e| format!("couldn't create {} ({e})", staging.display()))?;
         let gz = std::fs::File::open(file).map_err(|e| e.to_string())?;
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz));
+        // Never past what `check_metadata` read.
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz).take(MAX_TAR_BYTES));
         archive.set_preserve_permissions(true);
-        // Bound entry count and cumulative unpacked bytes to prevent decompression bombs (CWE-409).
-        const MAX_ENTRIES: usize = 50_000;
-        const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
         let mut entry_count = 0;
         let mut total_unpacked = 0u64;
         let mut directories = Vec::new();
@@ -1945,6 +2022,10 @@ pub(crate) mod tree {
         directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
         for mut dir in directories {
             dir.unpack_in(staging).map_err(|e| format!("couldn't unpack archive directory ({e})"))?;
+        }
+        // tar reads a limit-truncated stream as a clean end of archive, so an exhausted limit is refused here.
+        if archive.into_inner().limit() == 0 {
+            return Err("archive exceeds maximum size".into());
         }
         let top = single_top_folder(staging)?;
         if top.join("bin").join(app.id).is_file() {
@@ -2710,6 +2791,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_oversized_pax_record_is_refused_before_tar_buffers_it() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        // A PAX header claiming 1 MiB + 1 byte of records, compressed to almost nothing.
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::XHeader);
+        header.set_size((1 << 20) + 1);
+        header.set_path("pax").unwrap();
+        header.set_cksum();
+        let file = dir.path().join("pax.tar.gz");
+        let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(&file).unwrap(), flate2::Compression::best());
+        gz.write_all(header.as_bytes()).unwrap();
+        gz.write_all(&vec![b'a'; (1 << 20) + 512]).unwrap();
+        gz.finish().unwrap();
+        let err = tree::unpack(App::by_id("wordcraft").unwrap(), &file, &dir.path().join("staging")).unwrap_err();
+        assert!(err.contains("oversized metadata"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tree_files_does_not_traverse_directory_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
@@ -3292,6 +3393,8 @@ esac
         assert!(result.unwrap_err().contains("installed version 0.5.0 is newer"));
     }
 
+    /// An asset whose file name, link tag or link file name isn't the release's is refused before
+    /// the download, and so is one in another app's releases or with a foreign `SHA256SUMS.txt`.
     #[test]
     fn install_rejects_an_artifact_whose_version_is_not_the_advertised_one() {
         // The release advertises 99.0.0, but the selected artifact is an older official build
@@ -3337,6 +3440,175 @@ esac
             ..Asset::default()
         };
         assert!(bind_artifact_version(app, &release, &bad_tag).is_err());
+
+        // storytold/craft-launcher#764: another app's release with the right tag and name passes
+        // the bind (it reads only the path after `/releases/download/`), but the check before the
+        // download refuses it.
+        let other_repo = Asset {
+            name: "photocraft-99.0.0-linux-x86_64.AppImage".into(),
+            url: "https://github.com/storytold/vectorcraft/releases/download/v99.0.0/photocraft-99.0.0-linux-x86_64.AppImage".into(),
+            ..Asset::default()
+        };
+        assert!(bind_artifact_version(app, &release, &other_repo).is_ok());
+        let err = install_at(app, &release, &other_repo, PackageKind::AppImage, None, None, &mut job, None).unwrap_err();
+        assert!(err.contains("isn't the one its release publishes"), "{err}");
+        assert!(check_download_link(app, &release, &good).is_ok());
+
+        // The checksums the download is verified against must come from the release too.
+        let mut foreign_sums = release.clone();
+        foreign_sums.assets.push(Asset {
+            name: "SHA256SUMS.txt".into(),
+            url: "https://github.com/storytold/vectorcraft/releases/download/v99.0.0/SHA256SUMS.txt".into(),
+            ..Asset::default()
+        });
+        assert!(check_download_link(app, &foreign_sums, &good).is_err());
+
+        // A release the feed reads from a renamed repository records it, and its links are
+        // checked against that one; the same links are refused for a release that doesn't.
+        let renamed =
+            release::release_from_sums("storytold/photocraft-next", "v0.5.0", &[("a".repeat(64), "photocraft-0.5.0-linux-x86_64.AppImage".into())]);
+        assert!(check_download_link(app, &renamed, &renamed.assets[0]).is_ok());
+        let unrecorded = Release { repo: String::new(), ..renamed.clone() };
+        assert!(check_download_link(app, &unrecorded, &unrecorded.assets[0]).is_err());
+
+        // A `+` written plainly, as an older launcher's feed and saved releases have it, passes.
+        let plus = release::release_from_sums(app.repo, "v1.0.0+b.1", &[("a".repeat(64), "photocraft-1.0.0+b.1-linux-x86_64.AppImage".into())]);
+        let mut plain = plus.clone();
+        for a in &mut plain.assets {
+            a.url = a.url.replace("%2B", "+");
+        }
+        assert!(check_download_link(app, &plain, &plain.assets[0]).is_ok());
+    }
+
+    /// A release whose tag has a `+` (semver build metadata) has `%2B` in its links. Both checks
+    /// before the download accept them, so `install_at` gets as far as the download, which the
+    /// cancelled job ends before anything is fetched. A link with another escape is still refused.
+    #[test]
+    fn install_accepts_a_plus_release_up_to_the_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let phase = &mut |_| ();
+        let locations = InstallLocations::default();
+        let app = App::by_id("photocraft").unwrap();
+        let name = "photocraft-1.0.0+build.1-linux-x86_64.AppImage";
+        let release = release::release_from_sums(app.repo, "v1.0.0+build.1", &[("a".repeat(64), name.to_string())]);
+        let asset = release.assets[0].clone();
+        assert!(asset.url.ends_with("/download/v1.0.0%2Bbuild.1/photocraft-1.0.0%2Bbuild.1-linux-x86_64.AppImage"), "{}", asset.url);
+        assert_eq!(bind_artifact_version(app, &release, &asset), Ok(()));
+
+        let stop = Stop::default();
+        stop.cancel();
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let result = install_at(app, &release, &asset, PackageKind::AppImage, None, None, &mut job, None);
+        assert_eq!(result.unwrap_err(), crate::protocol::CANCELLED);
+
+        let other_escape = Asset { url: asset.url.replace("%2B", "%2b"), ..asset };
+        assert!(bind_artifact_version(app, &release, &other_escape).is_err());
+    }
+
+    /// craft-launcher#764: `install_at` refuses, before downloading, an asset whose link is the
+    /// right path on another host, and a release whose `SHA256SUMS.txt` (what the download is
+    /// checked against) is linked elsewhere. The stop is cancelled, so if the check stopped working
+    /// the install would end at the download with `CANCELLED` instead of fetching anything.
+    #[test]
+    fn install_refuses_links_off_the_releases_own_before_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let locations = InstallLocations::default();
+        let app = App::by_id("photocraft").unwrap();
+        let name = "photocraft-0.5.0-linux-x86_64.AppImage";
+        let own = release::release_from_sums(app.repo, "v0.5.0", &[("a".repeat(64), name.to_string())]);
+        let refuse = |release: &Release, asset: &Asset| {
+            let stop = Stop::default();
+            stop.cancel();
+            let phase = &mut |_| ();
+            let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+            let result = install_at(app, release, asset, PackageKind::AppImage, None, None, &mut job, None);
+            assert!(result.as_ref().is_err_and(|e| e.contains("isn't the one its release publishes")), "{}: {result:?}", asset.url);
+        };
+
+        for url in [
+            format!("https://evil.example/storytold/photocraft/releases/download/v0.5.0/{name}"),
+            format!("http://github.com/storytold/photocraft/releases/download/v0.5.0/{name}"),
+            format!("https://github.com.evil.example/storytold/photocraft/releases/download/v0.5.0/{name}"),
+        ] {
+            refuse(&own, &Asset { url, ..own.assets[0].clone() });
+        }
+
+        let mut sums_elsewhere = own.clone();
+        let sums = sums_elsewhere.assets.iter_mut().find(|a| a.name == "SHA256SUMS.txt").unwrap();
+        sums.url = "https://evil.example/storytold/photocraft/releases/download/v0.5.0/SHA256SUMS.txt".into();
+        refuse(&sums_elsewhere, &sums_elsewhere.assets[0]);
+    }
+
+    /// A download that fails its checksum (twice, as a resumed file gets one fresh try) replaces
+    /// nothing: the installed copy keeps its bytes, the install never starts, the record isn't
+    /// committed, and the bad file isn't kept for the next try.
+    #[test]
+    fn a_download_that_fails_its_checksum_replaces_nothing() {
+        use crate::http::tests::{Reply, body, serve};
+        let app = App::by_id("photocraft").unwrap();
+        let (body, sha) = body();
+        let (url, requests) = serve(body.clone(), vec![Reply::Corrupt, Reply::Corrupt]);
+        let name = "photocraft-0.5.0-linux-x86_64.AppImage";
+        let asset = Asset { name: name.into(), size: body.len() as u64, url, sha256: Some(sha) };
+        let release = Release { version: version::parse("0.5.0"), tag: "v0.5.0".into(), assets: vec![asset.clone()], ..Release::default() };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let old = dir.path().join("Apps").join("PhotoCraft.AppImage");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"the installed 0.4.0").unwrap();
+        let installed =
+            Installed { version: version::parse("0.4.0"), source: InstallSource::Launcher, location: old.display().to_string(), package: None };
+        let previous = record("0.4.0", PackageKind::AppImage, old.clone(), vec![], false);
+        let mut phases = Vec::new();
+        let mut phase = |p: JobPhase| phases.push(p);
+        let locations = InstallLocations::default();
+        let stop = Stop::default();
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase: &mut phase, install_locations: &locations, replace: false };
+        let mut committed = false;
+        let mut commit = |_: &Record| {
+            committed = true;
+            Ok(())
+        };
+        let result = install_at(app, &release, &asset, PackageKind::AppImage, Some(&installed), Some(&previous), &mut job, Some(&mut commit));
+        assert!(result.as_ref().is_err_and(|e| e.contains("checksum")), "{result:?}");
+        assert_eq!(std::fs::read(&old).unwrap(), b"the installed 0.4.0");
+        assert!(!phases.contains(&JobPhase::Installing), "{phases:?}");
+        assert!(!committed);
+        assert!(!download_path(&paths, &asset).exists());
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// A running installed copy isn't replaced; the stop is cancelled in case the check stops
+    /// working. Windows finds a process by its file name, so the running test binary stands in for
+    /// the copy. Elsewhere `pgrep -f` matches the command line, so a probe runs with the copy's path.
+    #[test]
+    fn install_refuses_while_the_installed_copy_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let phase = &mut |_| ();
+        let locations = InstallLocations::default();
+        let app = App::by_id("photocraft").unwrap();
+        let name = "photocraft-0.5.0-linux-x86_64.AppImage";
+        let release = release::release_from_sums(app.repo, "v0.5.0", &[("a".repeat(64), name.to_string())]);
+        #[cfg(windows)]
+        let location = std::env::current_exe().unwrap().display().to_string();
+        #[cfg(unix)]
+        let location = dir.path().join("PhotoCraft.AppImage").display().to_string();
+        #[cfg(unix)]
+        let _probe = crate::process::tests::RunningProbe::start(&location);
+        assert!(process::is_running(Path::new(&location)), "{location} should be seen as running");
+        let installed = Installed { version: version::parse("0.4.0"), source: InstallSource::Launcher, location, package: None };
+        let stop = Stop::default();
+        stop.cancel();
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let result = install_at(app, &release, &release.assets[0], PackageKind::AppImage, Some(&installed), None, &mut job, None);
+        assert!(result.as_ref().is_err_and(|e| e.contains("is running")), "{result:?}");
     }
 
     #[cfg(target_os = "linux")]
@@ -4019,11 +4291,16 @@ esac
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>images</key><array><dict><key>image-path</key><string>{}</string><key>system-entities</key><array><dict><key>dev-entry</key><string>/dev/disk5</string></dict></array></dict></array></dict></plist>",
                 dmg.display()
             );
-            for (answer, expected) in [
-                (Ok(true), vec![]),
-                // pgrep gave no answer: an attach of the image may still be running.
-                (Err("pgrep didn't finish within 30 seconds".to_string()), vec![]),
-                (Ok(false), vec!["info -plist".to_string(), "detach /dev/disk5 -force -quiet".to_string()]),
+            for (answer, expected, outcome) in [
+                (Ok(true), vec![], Ok(())),
+                // pgrep gave no answer: an attach of the image may still be running, and the image
+                // may still be attached.
+                (
+                    Err("pgrep didn't finish within 30 seconds".to_string()),
+                    vec![],
+                    Err("couldn't check for a running attach of the image (pgrep didn't finish within 30 seconds)".to_string()),
+                ),
+                (Ok(false), vec!["info -plist".to_string(), "detach /dev/disk5 -force -quiet".to_string()], Ok(())),
             ] {
                 let ran = std::cell::RefCell::new(Vec::new());
                 let result = super::macos::detach_unmounted_with(
@@ -4038,7 +4315,7 @@ esac
                         Ok(if args[0] == "info" { info.clone() } else { String::new() })
                     },
                 );
-                assert_eq!(result, Ok(()));
+                assert_eq!(result, outcome, "with the process check giving {answer:?}");
                 assert_eq!(ran.into_inner(), expected, "with the process check giving {answer:?}");
             }
         }
