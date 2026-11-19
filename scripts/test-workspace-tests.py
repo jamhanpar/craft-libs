@@ -25,14 +25,17 @@ if [ "$RUNNER_OS" = Linux ]; then
   python3 scripts/test-workspace-concurrency.py
   python3 scripts/test-workspace-tests.py
 fi
-cargo fmt --check
+if [ "$RUNNER_OS" != Windows ]; then
+  cargo fmt --check
+fi
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 """
 TEST_SOURCE = """
-cargo nextest run --workspace --all-features --locked --profile ci
+cargo nextest run --workspace --all-features --locked --profile ci --lib --bins --tests
+cargo nextest run -p craft-aep -p craft-video --all-features --locked --profile ci --example stubicc --example h264_h264enc_bench
 cargo test --workspace --doc --all-features --locked
-cargo nextest run -p craft-image-codecs -p craft-text --locked --profile ci
+cargo nextest run -p craft-image-codecs -p craft-text --locked --profile ci --lib --bins --tests
 """
 WINDOWS_SETUP = """powershell.exe -NoProfile -Command '$ErrorActionPreference = "Stop"; Start-Service Spooler; Add-PrinterDriver -Name "Generic / Text Only"'"""
 EXPECTED_SOURCE = {
@@ -88,19 +91,23 @@ COMMON = [
     "clippy --workspace --all-targets --all-features --locked -- -D warnings",
 ]
 TESTS = [
-    "nextest run --workspace --all-features --locked --profile ci",
+    "nextest run --workspace --all-features --locked --profile ci --lib --bins --tests",
+    "nextest run -p craft-aep -p craft-video --all-features --locked --profile ci --example stubicc --example h264_h264enc_bench",
     "test --workspace --doc --all-features --locked",
-    "nextest run -p craft-image-codecs -p craft-text --locked --profile ci",
+    "nextest run -p craft-image-codecs -p craft-text --locked --profile ci --lib --bins --tests",
 ]
 
 
 class WorkspaceTests(unittest.TestCase):
     def test_every_leg_lints_with_both_feature_sets(self):
-        for os_name in ("Linux", "macOS", "Windows"):
+        # Windows skips only rustfmt: one call with every source root of the workspace is longer
+        # than a Windows command line may be (os error 206), and Linux and macOS check the same
+        # formatting.
+        for os_name, expected in (("Linux", COMMON), ("macOS", COMMON), ("Windows", COMMON[1:])):
             with self.subTest(os=os_name):
                 result = commands(os_name, name="lint-command")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(), COMMON)
+                self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_linux_and_macos_run_one_feature_set_with_doctests(self):
         for os_name in ("Linux", "macOS"):
