@@ -1588,6 +1588,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-android-res"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-anicraft-format"
 version = "0.1.0"
 dependencies = [
@@ -1809,8 +1817,11 @@ dependencies = [
 name = "craft-develop"
 version = "0.1.0"
 dependencies = [
+ "craft-color",
  "craft-color-transform",
  "craft-develop-model",
+ "craft-geom",
+ "craft-raw",
  "craft-render-parity",
  "proptest",
  "rayon",
@@ -3453,6 +3464,7 @@ dependencies = [
 name = "craft-tga"
 version = "0.1.0"
 dependencies = [
+ "image",
  "thiserror 2.0.21",
 ]
 
@@ -3460,9 +3472,11 @@ dependencies = [
 name = "craft-tiff"
 version = "0.1.0"
 dependencies = [
+ "image",
  "proptest",
  "serde",
  "thiserror 2.0.21",
+ "tiff",
 ]
 
 [[package]]
