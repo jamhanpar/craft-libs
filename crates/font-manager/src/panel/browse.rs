@@ -99,8 +99,24 @@ impl FontsPanel {
                     let note = tl!("From each font's source, only when you install or preview a font.");
                     ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(s.p.muted)).wrap());
                 }
+                if self.installer.available_to_all_supported() {
+                    self.craft_apps_only_switch(ui, &s);
+                }
             });
         });
+    }
+
+    fn craft_apps_only_switch(&mut self, ui: &mut Ui, s: &Skin) {
+        ui.add_space(14.0);
+        ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), s.hairline());
+        ui.add_space(14.0);
+        widgets::label(ui, s, tl!("System fonts"), s.p.faint);
+        let mut on = self.craft_apps_only;
+        if ui.checkbox(&mut on, tl!("Keep fonts in Craft apps only")).changed() {
+            self.set_craft_apps_only(on);
+        }
+        let note = tl!("Off: Install also copies fonts to your system's fonts folder, for all apps. Fonts already installed keep their own setting.");
+        ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(s.p.muted)).wrap());
     }
 
     fn catalogue_filters(&mut self, ui: &mut Ui, s: &Skin) {
@@ -661,6 +677,7 @@ impl FontsPanel {
                     Kind::Install => tl!("Installing"),
                     Kind::Remove => tl!("Removing"),
                     Kind::Preview => tl!("Downloading"),
+                    Kind::SystemFonts => tl!("Updating system fonts"),
                 };
                 let text = match fraction {
                     Some(f) => format!("{what} {}", fmt("{percent} %", &[("percent", &i18n::number((f * 100.0).round() as u64))])),
@@ -683,6 +700,7 @@ impl FontsPanel {
                     Kind::Install => tl!("Couldn't install"),
                     Kind::Remove => tl!("Couldn't remove"),
                     Kind::Preview => tl!("Couldn't download"),
+                    Kind::SystemFonts => tl!("Couldn't update system fonts"),
                 };
                 widgets::label(ui, s, what, p.bad).on_hover_text(error);
             }
@@ -699,10 +717,10 @@ impl FontsPanel {
             }
             CardState::Offer { preview } => {
                 let Some(i) = index_position else { return };
-                let install = widgets::button(ui, s, tl!("Install"), widgets::Kind::Secondary, h, 0.0);
-                widgets::name(ui, &install, &fmt("Install {family}", &[("family", name)]));
-                if install.clicked() {
-                    self.ask(&ctx, Pending::Install(i));
+                let label = fmt("Install {family}", &[("family", name)]);
+                let menu = self.installer.available_to_all_supported();
+                if let Some(share) = widgets::install_button(ui, s, tl!("Install"), &label, widgets::Kind::Secondary, h, menu) {
+                    self.ask(&ctx, Pending::Install(i, share));
                 }
                 if preview {
                     let button = widgets::link(ui, s, tl!("Preview"));

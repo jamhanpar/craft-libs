@@ -16,7 +16,7 @@ use egui::{
 };
 
 use crate::index::{Family, FontFile, Index, script_name, source_label};
-use crate::panel::app::{Detail, FontsPanel, Pending, category_label, family_key, regular, source_name, style_count, style_name};
+use crate::panel::app::{Detail, FontsPanel, NotCopied, Pending, category_label, family_key, regular, source_name, style_count, style_name};
 use crate::panel::faces::{Owner, Shown};
 use crate::panel::i18n::{self, fmt, tl, tn};
 use crate::panel::jobs::Kind;
@@ -313,14 +313,23 @@ impl FontsPanel {
                         Kind::Install => tl!("Installing"),
                         Kind::Remove => tl!("Removing"),
                         Kind::Preview => tl!("Downloading"),
+                        Kind::SystemFonts => tl!("Updating system fonts"),
                     };
                     self.progress(ui, s, what, *fraction, 220.0);
                 }
                 _ => {
                     if all_installed {
                         widgets::badge(ui, s, if on_system { tl!("Installed on this system") } else { tl!("Installed") }, s.p.good, true);
-                    } else if widgets::button(ui, s, tl!("Install all"), widgets::Kind::Primary, s.h(), 0.0).clicked() {
-                        self.ask(&ctx, Pending::Install(i));
+                    } else if let Some(share) = widgets::install_button(
+                        ui,
+                        s,
+                        tl!("Install all"),
+                        tl!("Install all"),
+                        widgets::Kind::Primary,
+                        s.h(),
+                        self.installer.available_to_all_supported(),
+                    ) {
+                        self.ask(&ctx, Pending::Install(i, share));
                     }
                     if !store.is_empty() && widgets::button(ui, s, tl!("Remove all"), widgets::Kind::Danger, s.h(), 0.0).clicked() {
                         self.remove(&ctx, &family.family, &store, true);
@@ -332,6 +341,7 @@ impl FontsPanel {
                 }
             }
         });
+        self.system_fonts_line(ui, s, &family.family, &store);
         if session_preview {
             let note = fmt("Preview downloads this font ({size}) for this session without installing it.", &[("size", &size)]);
             ui.label(RichText::new(note).size(12.5).color(s.p.muted));
@@ -357,6 +367,7 @@ impl FontsPanel {
                 Kind::Install => tl!("Couldn't install"),
                 Kind::Remove => tl!("Couldn't remove"),
                 Kind::Preview => tl!("Couldn't download"),
+                Kind::SystemFonts => tl!("Couldn't update system fonts"),
             };
             let buttons: &[&str] = if failure.retry.is_some() { &[tl!("Retry")] } else { &[] };
             let mut retry = false;
@@ -476,6 +487,7 @@ impl FontsPanel {
                 self.remove(&ctx, &family.name, &family.faces, true);
             }
         });
+        self.system_fonts_line(ui, s, &family.name, &family.faces);
         ui.add_space(14.0);
         let rows = family
             .faces
@@ -497,6 +509,37 @@ impl FontsPanel {
         let scripts = self.index().and_then(|index| index.family(&family.name).map(|f| f.scripts.clone())).unwrap_or_default();
         self.sheet_body(ui, s, usize::MAX, &family.name, &scripts, rows, facts, Vec::new());
         close
+    }
+
+    /// Whether the family's store fonts are in the OS user font folder for all apps, or why not,
+    /// and the action that changes it.
+    fn system_fonts_line(&mut self, ui: &mut Ui, s: &Skin, family: &str, faces: &[FaceInfo]) {
+        let files: Vec<_> = faces.iter().filter(|f| f.source == Source::Store).filter_map(|f| f.path.clone()).collect();
+        if files.is_empty() {
+            return;
+        }
+        let not_here = self.installer.available_to_all_unsupported();
+        let available = not_here.is_none() && self.installer.is_available_to_all(family, &files);
+        let (text, colour) = if let Some(reason) = not_here {
+            (fmt("Only in Craft apps: {reason}", &[("reason", &reason)]), s.p.muted)
+        } else if available {
+            (tl!("Available to all apps").to_owned(), s.p.good)
+        } else if let Some(not_copied) = self.not_copied.get(&family.to_lowercase()) {
+            (not_copied_text(not_copied), s.p.warn)
+        } else {
+            (tl!("Kept in Craft apps only").to_owned(), s.p.muted)
+        };
+        let switch = self.installer.available_to_all_supported() && self.jobs.of("", family).is_none();
+        let size = vec2(ui.available_width(), ui.spacing().interact_size.y);
+        ui.allocate_ui_with_layout(size, direction::row(ui).with_main_wrap(true), |ui| {
+            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(colour)).wrap());
+            if switch {
+                let action = if available { tl!("Keep in Craft apps only") } else { tl!("Make available to all apps") };
+                if widgets::link(ui, s, action).clicked() {
+                    self.set_available_to_all(ui.ctx(), family, files.clone(), !available);
+                }
+            }
+        });
     }
 
     fn progress(&self, ui: &mut Ui, s: &Skin, what: &str, fraction: Option<f32>, width: f32) {
@@ -798,6 +841,18 @@ impl FontsPanel {
             let text = RichText::new(text).font(FontId::new(size, family)).color(color).variations(coords.iter().copied());
             ui.add(egui::Label::new(text).wrap());
         });
+    }
+}
+
+fn not_copied_text(not_copied: &NotCopied) -> String {
+    let conflict = match not_copied {
+        NotCopied::Failed(error) => return fmt("Couldn't copy to your system's fonts folder: {error}", &[("error", error)]),
+        NotCopied::Refused(conflicts) => conflicts.first(),
+    };
+    let file = conflict.map(|c| c.path.display().to_string()).unwrap_or_default();
+    match conflict.and_then(|c| c.postscript.as_deref()) {
+        Some(name) => fmt("Not copied to your system's fonts folder: {file} already has the font name {name}", &[("file", &file), ("name", name)]),
+        None => fmt("Not copied to your system's fonts folder: {file} is in the way", &[("file", &file)]),
     }
 }
 
